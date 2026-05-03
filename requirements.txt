@@ -5,3 +5,4 @@ uvicorn
 pathlib
 pyyaml
 watchdog
+hipporag

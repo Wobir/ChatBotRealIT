@@ -38,6 +38,7 @@ def load_LLM():
     print(f"Загружена модель: {engine_args.model}")
 
 
+
 def build_system_prompt() -> str:
     """Собирает все блоки данных в один system_prompt."""
     global system_prompt
