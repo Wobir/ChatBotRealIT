@@ -38,6 +38,80 @@ def load_LLM():
     print(f"Загружена модель: {engine_args.model}")
 
 
+def init_hipporag():
+    """Инициализация HippoRAG сервиса на основе конфигурации."""
+    global hipporag_service
+    try:
+        from python.hipporag_service import init_hipporag_from_config, get_hipporag_service
+
+        config = loader.config
+        if "hipporag" in config:
+            hipporag_service = init_hipporag_from_config(config)
+            print("HippoRAG сервис инициализирован")
+
+            # Автоматическая индексация документов если включена
+            if config["hipporag"].get("auto_index", False):
+                index_documents_from_configs()
+        else:
+            print("HippoRAG не настроен в config.yaml")
+    except Exception as e:
+        print(f"Ошибка инициализации HippoRAG: {e}")
+        traceback.print_exc()
+
+
+def index_documents_from_configs():
+    """Индексация документов из конфигурационных файлов в HippoRAG."""
+    global hipporag_service
+
+    if not hipporag_service or not hipporag_service._initialized:
+        return
+
+    try:
+        docs = []
+
+        # Собираем документы из всех YAML конфигов
+        for config_file in ["configs/courses.yaml", "configs/locations.yaml",
+                           "configs/teachers.yaml", "configs/examples.yaml"]:
+            config_path = Path(config_file)
+            if config_path.exists():
+                cfg = loader.load_yaml(str(config_path))
+
+                if isinstance(cfg, dict):
+                    for key, value in cfg.items():
+                        if isinstance(value, str):
+                            docs.append(f"{key}: {value}")
+                        elif isinstance(value, dict):
+                            for sub_key, sub_value in value.items():
+                                docs.append(f"{key} - {sub_key}: {sub_value}")
+                        elif isinstance(value, list):
+                            for item in value:
+                                docs.append(f"{key}: {item}")
+                elif isinstance(cfg, list):
+                    for item in cfg:
+                        if isinstance(item, dict):
+                            doc_parts = []
+                            for k, v in item.items():
+                                doc_parts.append(f"{k}: {v}")
+                            docs.append(" | ".join(doc_parts))
+                        else:
+                            docs.append(str(item))
+
+        # Добавляем system prompt как документ
+        system_prompt_path = Path("configs/system_prompt.txt")
+        if system_prompt_path.exists():
+            docs.append(f"System Prompt: {system_prompt_path.read_text(encoding='utf-8')}")
+
+        if docs:
+            print(f"Индексация {len(docs)} документов в HippoRAG...")
+            hipporag_service.index_documents(docs)
+            print("Индексация завершена")
+        else:
+            print("Нет документов для индексации")
+
+    except Exception as e:
+        print(f"Ошибка при индексации документов: {e}")
+        traceback.print_exc()
+
 
 def build_system_prompt() -> str:
     """Собирает все блоки данных в один system_prompt."""
@@ -126,8 +200,48 @@ async def lifespan(app):
 
 
 async def get_llm_reply(context: list, request_id: Optional[str] = None) -> AsyncGenerator[str, None]:
-    """Генерация ответа LLM на основе контекста."""
-    prompt_parts = [system_prompt, "Диалог с пользователем:"]
+    """Генерация ответа LLM на основе контекста с использованием HippoRAG для RAG."""
+    from python.hipporag_service import hipporag_service as rag_service
+
+    # Извлекаем последний вопрос пользователя
+    last_user_message = ""
+    for msg in reversed(context[-10:]):
+        role = getattr(msg, "role", None) or getattr(msg, "type", None)
+        if role == "user":
+            last_user_message = getattr(msg, "content", "")
+            break
+
+    # Если HippoRAG инициализирован, используем его для поиска релевантных документов
+    retrieved_context = ""
+    if rag_service and rag_service._initialized and last_user_message:
+        try:
+            retrieval_results = rag_service.hipporag.retrieve(
+                queries=[last_user_message],
+                num_to_retrieve=3,
+            )
+
+            if retrieval_results and len(retrieval_results) > 0:
+                retrieved_docs = []
+                for result in retrieval_results[0].get("retrieved_docs", []):
+                    if isinstance(result, dict):
+                        doc_text = result.get("text", result.get("content", str(result)))
+                    else:
+                        doc_text = str(result)
+                    retrieved_docs.append(doc_text)
+
+                if retrieved_docs:
+                    retrieved_context = "\n\n".join(retrieved_docs)
+        except Exception as e:
+            print(f"Ошибка при использовании HippoRAG: {e}")
+
+    # Формируем промпт
+    prompt_parts = [system_prompt]
+
+    # Добавляем retrieved контекст если есть
+    if retrieved_context:
+        prompt_parts.append(f"\n\nРелевантная информация из базы знаний:\n{retrieved_context}")
+
+    prompt_parts.append("\n\nДиалог с пользователем:")
     for msg in context[-10:]:
         role = getattr(msg, "role", None) or getattr(msg, "type", None)
         content = getattr(msg, "content", None)
@@ -138,7 +252,7 @@ async def get_llm_reply(context: list, request_id: Optional[str] = None) -> Asyn
     prompt_parts.append("Бот:")
 
     prompt = "\n".join(prompt_parts)
-    
+
     async for output in generate_answer(prompt, loader.sampling_params, request_id):
         for completion in output.outputs:
             if completion.text:
